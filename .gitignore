@@ -1,0 +1,11 @@
+.build/
+.DS_Store
+dist/
+*.dmg
+.env
+.env.*
+**/env
+**/.config/
+*.xcuserstate
+.idea/
+.vscode/
