@@ -20,7 +20,23 @@ enum DoctorReport {
             checkSystemAudio(),
             checkRecordingsRoot(recordingsRoot),
             checkTranscription(),
+            checkCartesia(),
         ]
+    }
+
+    static func checkCartesia() -> Check {
+        if Config.cartesiaAPIKey() != nil {
+            return Check(
+                name: "cartesia tts",
+                status: .ok,
+                remediation: "voice=\(Config.cartesiaVoiceId().prefix(8))… model=\(Config.cartesiaModelId())"
+            )
+        }
+        return Check(
+            name: "cartesia tts",
+            status: .warn("CARTESIA_API_KEY not set"),
+            remediation: "add CARTESIA_API_KEY to ~/.config/quill/env to enable «Озвучить»"
+        )
     }
 
     static func checkMicrophone() -> Check {

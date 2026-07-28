@@ -84,21 +84,37 @@ enum Config {
     /// File wins over process env so a stale/exported shell key cannot
     /// silently override the key intentionally placed for quill.
     static func openAIAPIKey() -> String? {
-        let envName = transcriptionAPIKeyEnv()
-        if let fromFile = loadDotEnv(envPath)[envName], !fromFile.isEmpty {
-            return fromFile
-        }
-        if let v = ProcessInfo.processInfo.environment[envName], !v.isEmpty {
-            return v
-        }
-        if let inline = transcription()?["api_key"] as? String, !inline.isEmpty {
-            return inline
-        }
-        return nil
+        secret(transcriptionAPIKeyEnv())
+            ?? (transcription()?["api_key"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Cartesia API key for summary TTS.
+    static func cartesiaAPIKey() -> String? {
+        secret("CARTESIA_API_KEY")
+    }
+
+    static func cartesiaVoiceId() -> String {
+        secret("CARTESIA_DEFAULT_VOICE_ID")
+            ?? "6ccbfb76-1fc6-48f7-b71d-91ac6298247b"
+    }
+
+    static func cartesiaModelId() -> String {
+        secret("CARTESIA_TTS_MODEL_ID") ?? "sonic-3"
     }
 
     private static func transcription() -> [String: Any]? {
         load()?["transcription"] as? [String: Any]
+    }
+
+    /// Read a secret from ~/.config/quill/env first, then process environment.
+    private static func secret(_ name: String) -> String? {
+        if let fromFile = loadDotEnv(envPath)[name], !fromFile.isEmpty {
+            return fromFile
+        }
+        if let v = ProcessInfo.processInfo.environment[name], !v.isEmpty {
+            return v
+        }
+        return nil
     }
 
     /// Minimal KEY=VALUE parser for ~/.config/quill/env.

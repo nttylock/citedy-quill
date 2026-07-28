@@ -27,9 +27,7 @@ enum SummaryService {
         apiKey: String,
         baseURL: URL
     ) async throws -> TranscriptSummary {
-        let langHint = (language == "ru" || language?.hasPrefix("ru") == true)
-            ? "Отвечай на русском языке."
-            : "Reply in the same language as the transcript."
+        let langHint = languageHint(language)
 
         let system = """
         You are a meeting-notes assistant. \(langHint)
@@ -40,19 +38,110 @@ enum SummaryService {
         Ignore filler, greetings, and speech-to-text noise. Be concrete.
         """
 
-        let user = transcript.isEmpty
-            ? "(empty transcript)"
-            : String(transcript.prefix(100_000))
+        let content = try await chatJSON(
+            system: system,
+            user: transcript,
+            apiKey: apiKey,
+            baseURL: baseURL,
+            temperature: 0.2
+        )
+        return try parseSummaryContent(content)
+    }
 
-        let body: [String: Any] = [
+    /// Formal meeting protocol: decisions, action items, open questions.
+    static func generateProtocol(
+        transcript: String,
+        language: String?,
+        apiKey: String,
+        baseURL: URL
+    ) async throws -> String {
+        let langHint = languageHint(language)
+        let system = """
+        You are an executive assistant writing a formal meeting protocol. \(langHint)
+        From the speaker-tagged transcript produce a clean protocol in markdown with sections:
+        ## Участники (if inferable, else skip)
+        ## Повестка / темы
+        ## Решения
+        ## Action items (who / what / when if known)
+        ## Открытые вопросы
+        ## Краткий итог (2-3 sentences)
+        Be factual. No filler. If something is unclear, say so briefly.
+        Return ONLY the markdown protocol, no JSON wrapper.
+        """
+        return try await chatText(
+            system: system,
+            user: transcript,
+            apiKey: apiKey,
+            baseURL: baseURL,
+            temperature: 0.2
+        )
+    }
+
+    // MARK: - OpenAI chat helpers
+
+    private static func languageHint(_ language: String?) -> String {
+        (language == "ru" || language?.hasPrefix("ru") == true)
+            ? "Отвечай на русском языке."
+            : "Reply in the same language as the transcript."
+    }
+
+    private static func chatJSON(
+        system: String,
+        user: String,
+        apiKey: String,
+        baseURL: URL,
+        temperature: Double
+    ) async throws -> String {
+        try await chat(
+            system: system,
+            user: user,
+            apiKey: apiKey,
+            baseURL: baseURL,
+            temperature: temperature,
+            jsonObject: true
+        )
+    }
+
+    private static func chatText(
+        system: String,
+        user: String,
+        apiKey: String,
+        baseURL: URL,
+        temperature: Double
+    ) async throws -> String {
+        try await chat(
+            system: system,
+            user: user,
+            apiKey: apiKey,
+            baseURL: baseURL,
+            temperature: temperature,
+            jsonObject: false
+        )
+    }
+
+    private static func chat(
+        system: String,
+        user: String,
+        apiKey: String,
+        baseURL: URL,
+        temperature: Double,
+        jsonObject: Bool
+    ) async throws -> String {
+        let userText = user.isEmpty
+            ? "(empty transcript)"
+            : String(user.prefix(100_000))
+
+        var body: [String: Any] = [
             "model": "gpt-4o-mini",
-            "temperature": 0.2,
-            "response_format": ["type": "json_object"],
+            "temperature": temperature,
             "messages": [
                 ["role": "system", "content": system],
-                ["role": "user", "content": user],
+                ["role": "user", "content": userText],
             ],
         ]
+        if jsonObject {
+            body["response_format"] = ["type": "json_object"]
+        }
 
         let endpoint = baseURL.appendingPathComponent("chat/completions")
         var request = URLRequest(url: endpoint)
@@ -79,13 +168,11 @@ enum SummaryService {
         else {
             throw SummaryServiceError.badResponse("missing choices.message.content")
         }
-
-        return try parseContent(content)
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func parseContent(_ content: String) throws -> TranscriptSummary {
+    private static func parseSummaryContent(_ content: String) throws -> TranscriptSummary {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Strip accidental ```json fences
         var jsonText = trimmed
         if jsonText.hasPrefix("```") {
             jsonText = jsonText

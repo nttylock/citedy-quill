@@ -1,9 +1,10 @@
 import AppKit
+import AVFoundation
 
-/// Result window shown after Stop: loader → transcript + LLM summary,
-/// with copy / email actions. No osascript, no external .md open.
+/// Result window after Stop: loader → summary/transcript + actions:
+/// Protocol · Speak (Cartesia) · Share (Copy / Mail / Telegram / WhatsApp)
 @MainActor
-final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
+final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AVAudioPlayerDelegate {
     enum Phase {
         case loading(String)
         case ready
@@ -15,23 +16,35 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
     private let spinner = NSProgressIndicator()
     private let transcriptView = NSTextView()
     private let summaryView = NSTextView()
+
+    // Top utility
     private let copyButton = NSButton()
-    private let emailButton = NSButton()
     private let openFolderButton = NSButton()
+
+    // Action bar (slice)
+    private let protocolButton = NSButton()
+    private let speakButton = NSButton()
+    private let shareButton = NSButton()
 
     private var sessionDir: URL?
     private var plainText: String = ""
+    private var summaryPlain: String = ""
     private var displayTitle: String = "Transcript"
+    private var isBusy = false
+
+    private var audioPlayer: AVAudioPlayer?
+    private var audioFileURL: URL?
+    private var isSpeaking = false
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 740, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Quill"
-        window.minSize = NSSize(width: 520, height: 420)
+        window.minSize = NSSize(width: 560, height: 480)
         window.isReleasedWhenClosed = false
         window.center()
         self.init(window: window)
@@ -42,20 +55,16 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - public API
 
     func presentLoading(sessionName: String, sessionDir: URL) {
-        self.sessionDir = sessionDir
-        self.displayTitle = sessionName
-        self.plainText = ""
-        titleLabel.stringValue = sessionName
-        window?.title = "Quill — \(sessionName)"
+        resetSession(name: sessionName, dir: sessionDir)
         setPhase(.loading("Транскрибация…"))
         transcriptView.string = ""
         summaryView.string = ""
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        setActionsEnabled(false)
+        showFront()
     }
 
     func presentTranscript(sessionName: String, sessionDir: URL, plainText: String, markdown: String) {
+        _ = markdown
         self.sessionDir = sessionDir
         self.displayTitle = sessionName
         self.plainText = plainText
@@ -64,9 +73,8 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
         transcriptView.string = plainText.isEmpty ? "(пусто)" : plainText
         summaryView.string = "Суммаризация…"
         setPhase(.loading("Суммаризация (gpt-4o-mini)…"))
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        setActionsEnabled(false)
+        showFront()
     }
 
     func presentSummary(_ summary: TranscriptSummary) {
@@ -77,10 +85,11 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
                 block += "\(i + 1). \(p)\n"
             }
         }
-        summaryView.string = block.trimmingCharacters(in: .whitespacesAndNewlines)
+        summaryPlain = block.trimmingCharacters(in: .whitespacesAndNewlines)
+        summaryView.string = summaryPlain
         setPhase(.ready)
+        setActionsEnabled(true)
 
-        // Persist next to audio for later.
         if let dir = sessionDir {
             let md = """
             # \(displayTitle) — summary
@@ -103,17 +112,18 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
         if transcriptView.string.isEmpty {
             transcriptView.string = message
         }
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        setActionsEnabled(!plainText.isEmpty)
+        showFront()
     }
 
-    /// Transcript is already usable; only summary failed.
     func presentSummaryError(_ message: String) {
         summaryView.string = "Саммари недоступно:\n\(message)"
+        summaryPlain = ""
         setPhase(.ready)
         statusLabel.stringValue = "Транскрипт готов · саммари ошибка"
         statusLabel.textColor = .systemOrange
+        // Protocol can still run from transcript; speak needs summary text → use transcript slice
+        setActionsEnabled(!plainText.isEmpty)
     }
 
     func updateLoadingStatus(_ text: String) {
@@ -135,35 +145,12 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
 
-        copyButton.image = NSImage(
-            systemSymbolName: "doc.on.doc",
-            accessibilityDescription: "Copy"
-        )
-        copyButton.imagePosition = .imageOnly
-        copyButton.bezelStyle = .flexiblePush
-        copyButton.toolTip = "Скопировать весь текст"
-        copyButton.target = self
-        copyButton.action = #selector(copyAll)
+        styleIconButton(copyButton, symbol: "doc.on.doc", tooltip: "Скопировать", action: #selector(copyAll))
+        styleIconButton(openFolderButton, symbol: "folder", tooltip: "Папка записи", action: #selector(openFolder))
 
-        emailButton.image = NSImage(
-            systemSymbolName: "envelope",
-            accessibilityDescription: "Email"
-        )
-        emailButton.imagePosition = .imageOnly
-        emailButton.bezelStyle = .flexiblePush
-        emailButton.toolTip = "Отправить в Mail"
-        emailButton.target = self
-        emailButton.action = #selector(emailAll)
-
-        openFolderButton.image = NSImage(
-            systemSymbolName: "folder",
-            accessibilityDescription: "Folder"
-        )
-        openFolderButton.imagePosition = .imageOnly
-        openFolderButton.bezelStyle = .flexiblePush
-        openFolderButton.toolTip = "Открыть папку записи"
-        openFolderButton.target = self
-        openFolderButton.action = #selector(openFolder)
+        styleTextButton(protocolButton, title: "Протокол", symbol: "doc.plaintext", action: #selector(runProtocol))
+        styleTextButton(speakButton, title: "Озвучить", symbol: "speaker.wave.2", action: #selector(toggleSpeak))
+        styleTextButton(shareButton, title: "Поделиться", symbol: "square.and.arrow.up", action: #selector(shareMenu))
 
         configureTextView(transcriptView)
         configureTextView(summaryView)
@@ -172,23 +159,28 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
         let transcriptScroll = wrapScroll(transcriptView)
         let summaryScroll = wrapScroll(summaryView)
 
-        let transcriptHeader = sectionLabel("Транскрипт")
-        let summaryHeader = sectionLabel("Саммари")
-
-        let toolbar = NSStackView(views: [statusLabel, spinner, NSView(), copyButton, emailButton, openFolderButton])
-        toolbar.orientation = .horizontal
-        toolbar.alignment = .centerY
-        toolbar.spacing = 8
-        toolbar.setHuggingPriority(.defaultLow, for: .horizontal)
+        let topBar = NSStackView(views: [
+            statusLabel, spinner, NSView(), copyButton, openFolderButton,
+        ])
+        topBar.orientation = .horizontal
+        topBar.alignment = .centerY
+        topBar.spacing = 8
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        let actionBar = NSStackView(views: [protocolButton, speakButton, shareButton, NSView()])
+        actionBar.orientation = .horizontal
+        actionBar.alignment = .centerY
+        actionBar.spacing = 10
+        actionBar.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 0)
+
         let root = NSStackView(views: [
             titleLabel,
-            toolbar,
-            summaryHeader,
+            topBar,
+            actionBar,
+            sectionLabel("Саммари"),
             summaryScroll,
-            transcriptHeader,
+            sectionLabel("Транскрипт"),
             transcriptScroll,
         ])
         root.orientation = .vertical
@@ -203,20 +195,38 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
             root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             root.topAnchor.constraint(equalTo: content.topAnchor),
             root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            toolbar.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32),
+            topBar.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32),
+            actionBar.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32),
             titleLabel.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32),
             summaryScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            summaryScroll.heightAnchor.constraint(equalTo: transcriptScroll.heightAnchor, multiplier: 0.45),
-            transcriptScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            summaryScroll.heightAnchor.constraint(equalTo: transcriptScroll.heightAnchor, multiplier: 0.5),
+            transcriptScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
             summaryScroll.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32),
             transcriptScroll.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32),
             copyButton.widthAnchor.constraint(equalToConstant: 32),
             copyButton.heightAnchor.constraint(equalToConstant: 28),
-            emailButton.widthAnchor.constraint(equalToConstant: 32),
-            emailButton.heightAnchor.constraint(equalToConstant: 28),
             openFolderButton.widthAnchor.constraint(equalToConstant: 32),
             openFolderButton.heightAnchor.constraint(equalToConstant: 28),
         ])
+    }
+
+    private func styleIconButton(_ button: NSButton, symbol: String, tooltip: String, action: Selector) {
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
+        button.imagePosition = .imageOnly
+        button.bezelStyle = .flexiblePush
+        button.toolTip = tooltip
+        button.target = self
+        button.action = action
+    }
+
+    private func styleTextButton(_ button: NSButton, title: String, symbol: String, action: Selector) {
+        button.title = title
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        button.imagePosition = .imageLeading
+        button.bezelStyle = .rounded
+        button.target = self
+        button.action = action
+        button.setContentHuggingPriority(.required, for: .horizontal)
     }
 
     private func sectionLabel(_ text: String) -> NSTextField {
@@ -262,57 +272,54 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
             statusLabel.stringValue = msg
             statusLabel.textColor = .secondaryLabelColor
             spinner.startAnimation(nil)
-            copyButton.isEnabled = !plainText.isEmpty
-            emailButton.isEnabled = !plainText.isEmpty
+            isBusy = true
         case .ready:
             statusLabel.stringValue = "Готово"
             statusLabel.textColor = .secondaryLabelColor
             spinner.stopAnimation(nil)
-            copyButton.isEnabled = true
-            emailButton.isEnabled = true
+            isBusy = false
         case .failed(let msg):
             statusLabel.stringValue = msg
             statusLabel.textColor = .systemRed
             spinner.stopAnimation(nil)
-            copyButton.isEnabled = !plainText.isEmpty
-            emailButton.isEnabled = !plainText.isEmpty
+            isBusy = false
         }
+    }
+
+    private func setActionsEnabled(_ enabled: Bool) {
+        let on = enabled && !isBusy
+        protocolButton.isEnabled = on && !plainText.isEmpty
+        speakButton.isEnabled = on && speakableText() != nil
+        shareButton.isEnabled = on && !shareText().isEmpty
+        copyButton.isEnabled = !plainText.isEmpty || !summaryPlain.isEmpty
+    }
+
+    private func resetSession(name: String, dir: URL) {
+        stopAudio()
+        sessionDir = dir
+        displayTitle = name
+        plainText = ""
+        summaryPlain = ""
+        audioFileURL = nil
+        titleLabel.stringValue = name
+        window?.title = "Quill — \(name)"
+        speakButton.title = "Озвучить"
+    }
+
+    private func showFront() {
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - actions
 
     @objc private func copyAll() {
-        let text = composedShareText()
+        let text = shareText()
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        statusLabel.stringValue = "Скопировано"
-        statusLabel.textColor = .systemGreen
-    }
-
-    @objc private func emailAll() {
-        let text = composedShareText()
-        guard !text.isEmpty else { return }
-
-        var components = URLComponents()
-        components.scheme = "mailto"
-        // Empty recipient — user picks contacts in Mail.
-        components.path = ""
-        components.queryItems = [
-            URLQueryItem(name: "subject", value: "Quill: \(displayTitle)"),
-            URLQueryItem(name: "body", value: text),
-        ]
-        if let url = components.url {
-            NSWorkspace.shared.open(url)
-            statusLabel.stringValue = "Открыт Mail"
-            statusLabel.textColor = .secondaryLabelColor
-        } else {
-            // Fallback: copy and notify.
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-            statusLabel.stringValue = "mailto не собрался — текст в буфере"
-            statusLabel.textColor = .systemOrange
-        }
+        flashStatus("Скопировано", .systemGreen)
     }
 
     @objc private func openFolder() {
@@ -321,10 +328,218 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func composedShareText() -> String {
+    @objc private func runProtocol() {
+        guard !isBusy, !plainText.isEmpty else { return }
+        guard let apiKey = Config.openAIAPIKey() else {
+            flashStatus("Нет OPENAI_API_KEY", .systemRed)
+            return
+        }
+        setPhase(.loading("Протокол (gpt-4o-mini)…"))
+        setActionsEnabled(false)
+
+        Task {
+            do {
+                let proto = try await SummaryService.generateProtocol(
+                    transcript: plainText,
+                    language: Config.transcriptionLanguage(),
+                    apiKey: apiKey,
+                    baseURL: Config.transcriptionBaseURL()
+                )
+                await MainActor.run {
+                    // Show protocol in summary pane (primary deliverable).
+                    summaryPlain = proto
+                    summaryView.string = proto
+                    if let dir = self.sessionDir {
+                        try? Data(proto.utf8).write(
+                            to: dir.appendingPathComponent("protocol.md"),
+                            options: .atomic
+                        )
+                    }
+                    // Invalidate old audio — text changed.
+                    self.audioFileURL = nil
+                    self.stopAudio()
+                    self.setPhase(.ready)
+                    self.setActionsEnabled(true)
+                    self.flashStatus("Протокол готов", .systemGreen)
+                }
+            } catch {
+                await MainActor.run {
+                    self.setPhase(.ready)
+                    self.setActionsEnabled(true)
+                    self.flashStatus("Протокол: \(error)", .systemRed)
+                }
+            }
+        }
+    }
+
+    @objc private func toggleSpeak() {
+        if isSpeaking {
+            stopAudio()
+            flashStatus("Остановлено", .secondaryLabelColor)
+            return
+        }
+        guard !isBusy else { return }
+        guard let text = speakableText() else {
+            flashStatus("Нечего озвучивать — дождись саммари или сделай протокол", .systemOrange)
+            return
+        }
+
+        // Reuse cached mp3 if still present.
+        if let url = audioFileURL, FileManager.default.fileExists(atPath: url.path) {
+            play(url: url)
+            return
+        }
+
+        guard let apiKey = Config.cartesiaAPIKey() else {
+            flashStatus("Нет CARTESIA_API_KEY в ~/.config/quill/env", .systemRed)
+            return
+        }
+
+        setPhase(.loading("Озвучка (Cartesia)…"))
+        setActionsEnabled(false)
+
+        let voice = Config.cartesiaVoiceId()
+        let model = Config.cartesiaModelId()
+        let lang = Config.transcriptionLanguage()
+
+        Task {
+            do {
+                let mp3 = try await CartesiaService.synthesizeMP3(
+                    text: text,
+                    language: lang,
+                    apiKey: apiKey,
+                    voiceId: voice,
+                    modelId: model
+                )
+                let url: URL
+                if let dir = self.sessionDir {
+                    url = dir.appendingPathComponent("summary.mp3")
+                    try mp3.write(to: url, options: .atomic)
+                } else {
+                    url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("quill-summary-\(UUID().uuidString).mp3")
+                    try mp3.write(to: url, options: .atomic)
+                }
+                await MainActor.run {
+                    self.audioFileURL = url
+                    self.setPhase(.ready)
+                    self.setActionsEnabled(true)
+                    self.play(url: url)
+                }
+            } catch {
+                await MainActor.run {
+                    self.setPhase(.ready)
+                    self.setActionsEnabled(true)
+                    self.flashStatus("TTS: \(error)", .systemRed)
+                }
+            }
+        }
+    }
+
+    @objc private func shareMenu(_ sender: NSButton) {
+        let menu = NSMenu(title: "Share")
+        menu.addItem(withTitle: "Скопировать текст", action: #selector(copyAll), keyEquivalent: "")
+        menu.addItem(withTitle: "Mail…", action: #selector(shareMail), keyEquivalent: "")
+        menu.addItem(withTitle: "Telegram…", action: #selector(shareTelegram), keyEquivalent: "")
+        menu.addItem(withTitle: "WhatsApp…", action: #selector(shareWhatsApp), keyEquivalent: "")
+        if audioFileURL != nil {
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Показать audio файл", action: #selector(revealAudio), keyEquivalent: "")
+        }
+        for item in menu.items { item.target = self }
+        let point = NSPoint(x: 0, y: sender.bounds.height + 2)
+        menu.popUp(positioning: nil, at: point, in: sender)
+    }
+
+    @objc private func shareMail() {
+        openShareURL(scheme: "mailto", query: [
+            "subject": "Quill: \(displayTitle)",
+            "body": shareText(),
+        ], emptyPath: true)
+    }
+
+    @objc private func shareTelegram() {
+        // t.me/share wants url + text; we put content in text.
+        let text = shareText(max: 3500)
+        openShareURL(absolute: "https://t.me/share/url", query: [
+            "url": "https://github.com/nttylock/citedy-quill",
+            "text": text,
+        ])
+    }
+
+    @objc private func shareWhatsApp() {
+        let text = shareText(max: 3500)
+        openShareURL(absolute: "https://wa.me/", query: [
+            "text": text,
+        ])
+    }
+
+    @objc private func revealAudio() {
+        if let url = audioFileURL {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    // MARK: - audio
+
+    private func play(url: URL) {
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.delegate = self
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+            isSpeaking = true
+            speakButton.title = "Стоп"
+            speakButton.image = NSImage(
+                systemSymbolName: "stop.fill",
+                accessibilityDescription: "Stop"
+            )
+            flashStatus("Играет…", .secondaryLabelColor)
+        } catch {
+            flashStatus("Play: \(error)", .systemRed)
+        }
+    }
+
+    private func stopAudio() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        isSpeaking = false
+        speakButton.title = "Озвучить"
+        speakButton.image = NSImage(
+            systemSymbolName: "speaker.wave.2",
+            accessibilityDescription: "Speak"
+        )
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in
+            self.isSpeaking = false
+            self.speakButton.title = "Озвучить"
+            self.speakButton.image = NSImage(
+                systemSymbolName: "speaker.wave.2",
+                accessibilityDescription: "Speak"
+            )
+            self.flashStatus(flag ? "Готово" : "Воспроизведение прервано", .secondaryLabelColor)
+        }
+    }
+
+    // MARK: - text helpers
+
+    /// Prefer summary/protocol for TTS; fall back to short transcript head.
+    private func speakableText() -> String? {
+        let s = summaryPlain.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty, !s.hasPrefix("Саммари недоступно"), s != "Суммаризация…" {
+            return String(s.prefix(2500))
+        }
+        let t = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return nil }
+        return String(t.prefix(1500))
+    }
+
+    private func shareText(max: Int? = nil) -> String {
         var parts: [String] = []
         let summary = summaryView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !summary.isEmpty, summary != "Суммаризация…", !summary.hasPrefix("(") {
+        if !summary.isEmpty, summary != "Суммаризация…", !summary.hasPrefix("Саммари недоступно") {
             parts.append(summary)
             parts.append("")
         }
@@ -335,6 +550,37 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate {
             parts.append("ТРАНСКРИПТ")
             parts.append(body)
         }
-        return parts.joined(separator: "\n")
+        var text = parts.joined(separator: "\n")
+        if let max, text.count > max {
+            text = String(text.prefix(max)) + "\n…"
+        }
+        return text
+    }
+
+    private func openShareURL(scheme: String? = nil, absolute: String? = nil, query: [String: String], emptyPath: Bool = false) {
+        var components: URLComponents
+        if let absolute, let u = URLComponents(string: absolute) {
+            components = u
+        } else if let scheme {
+            components = URLComponents()
+            components.scheme = scheme
+            if emptyPath { components.path = "" }
+        } else {
+            return
+        }
+        components.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
+        if let url = components.url {
+            NSWorkspace.shared.open(url)
+            flashStatus("Открыто", .secondaryLabelColor)
+        } else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(shareText(), forType: .string)
+            flashStatus("URL не собрался — текст в буфере", .systemOrange)
+        }
+    }
+
+    private func flashStatus(_ text: String, _ color: NSColor) {
+        statusLabel.stringValue = text
+        statusLabel.textColor = color
     }
 }
