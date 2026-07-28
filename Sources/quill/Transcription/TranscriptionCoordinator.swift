@@ -157,6 +157,13 @@ actor TranscriptionCoordinator {
         }
         merged.sort { $0.start_ms < $1.start_ms }
 
+        let beforeFilter = merged.count
+        merged = TranscriptCleanup.filterSegments(merged)
+        let dropped = beforeFilter - merged.count
+        if dropped > 0 {
+            log(dir, "dropped \(dropped) hallucinated segment(s) (subtitle-credits / silence junk)")
+        }
+
         // Don't write an empty "success" transcript when every track failed —
         // resumePending uses presence of transcript.json as "done".
         if tracksAttempted > 0, trackErrors == tracksAttempted, merged.isEmpty {
@@ -294,8 +301,8 @@ private struct SessionMeta {
 }
 
 /// Canonical transcript. Property names are the JSON schema — this struct
-/// exists to be serialized.
-private struct Transcript: Codable {
+/// exists to be serialized. (`TranscriptCleanup` filters segment text.)
+struct Transcript: Codable {
     struct Segment: Codable {
         let speaker: String
         let start_ms: Int

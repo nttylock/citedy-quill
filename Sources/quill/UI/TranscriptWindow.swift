@@ -20,11 +20,16 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
     // Top utility
     private let copyButton = NSButton()
     private let openFolderButton = NSButton()
+    private let quitButton = NSButton()
+    private let quitLabeledButton = NSButton()
 
     // Action bar (slice)
     private let protocolButton = NSButton()
     private let speakButton = NSButton()
     private let shareButton = NSButton()
+
+    /// App quit (wired from AppController).
+    var onQuit: (() -> Void)?
 
     private var sessionDir: URL?
     private var plainText: String = ""
@@ -147,10 +152,13 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
 
         styleIconButton(copyButton, symbol: "doc.on.doc", tooltip: "Скопировать", action: #selector(copyAll))
         styleIconButton(openFolderButton, symbol: "folder", tooltip: "Папка записи", action: #selector(openFolder))
+        styleIconButton(quitButton, symbol: "xmark.circle.fill", tooltip: "Выйти из Quill", action: #selector(quitApp))
 
         styleTextButton(protocolButton, title: "Протокол", symbol: "doc.plaintext", action: #selector(runProtocol))
         styleTextButton(speakButton, title: "Озвучить", symbol: "speaker.wave.2", action: #selector(toggleSpeak))
         styleTextButton(shareButton, title: "Поделиться", symbol: "square.and.arrow.up", action: #selector(shareMenu))
+        // Explicit labeled quit — not just a tiny power icon.
+        styleTextButton(quitLabeledButton, title: "Выйти", symbol: "xmark.circle", action: #selector(quitApp))
 
         configureTextView(transcriptView)
         configureTextView(summaryView)
@@ -160,7 +168,7 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
         let summaryScroll = wrapScroll(summaryView)
 
         let topBar = NSStackView(views: [
-            statusLabel, spinner, NSView(), copyButton, openFolderButton,
+            statusLabel, spinner, NSView(), copyButton, openFolderButton, quitButton,
         ])
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
@@ -168,7 +176,9 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let actionBar = NSStackView(views: [protocolButton, speakButton, shareButton, NSView()])
+        let actionBar = NSStackView(views: [
+            protocolButton, speakButton, shareButton, NSView(), quitLabeledButton,
+        ])
         actionBar.orientation = .horizontal
         actionBar.alignment = .centerY
         actionBar.spacing = 10
@@ -207,6 +217,8 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
             copyButton.heightAnchor.constraint(equalToConstant: 28),
             openFolderButton.widthAnchor.constraint(equalToConstant: 32),
             openFolderButton.heightAnchor.constraint(equalToConstant: 28),
+            quitButton.widthAnchor.constraint(equalToConstant: 32),
+            quitButton.heightAnchor.constraint(equalToConstant: 28),
         ])
     }
 
@@ -328,6 +340,10 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
         }
     }
 
+    @objc private func quitApp() {
+        onQuit?()
+    }
+
     @objc private func runProtocol() {
         guard !isBusy, !plainText.isEmpty else { return }
         guard let apiKey = Config.openAIAPIKey() else {
@@ -378,18 +394,21 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
             flashStatus("Остановлено", .secondaryLabelColor)
             return
         }
+        // If audio already generated → play. Else synthesize then play.
+        if let url = resolvedAudioURL() {
+            play(url: url)
+            return
+        }
+        generateAudioAndPlay()
+    }
+
+    /// Ensure summary.mp3 exists (Cartesia), then play.
+    private func generateAudioAndPlay() {
         guard !isBusy else { return }
         guard let text = speakableText() else {
             flashStatus("Нечего озвучивать — дождись саммари или сделай протокол", .systemOrange)
             return
         }
-
-        // Reuse cached mp3 if still present.
-        if let url = audioFileURL, FileManager.default.fileExists(atPath: url.path) {
-            play(url: url)
-            return
-        }
-
         guard let apiKey = Config.cartesiaAPIKey() else {
             flashStatus("Нет CARTESIA_API_KEY в ~/.config/quill/env", .systemRed)
             return
@@ -437,29 +456,62 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
     }
 
     @objc private func shareMenu(_ sender: NSButton) {
+        // Flat menu — no nested submenus (they were easy to miss / grayed out).
         let menu = NSMenu(title: "Share")
-        menu.addItem(withTitle: "Скопировать текст", action: #selector(copyAll), keyEquivalent: "")
-        menu.addItem(withTitle: "Mail…", action: #selector(shareMail), keyEquivalent: "")
-        menu.addItem(withTitle: "Telegram…", action: #selector(shareTelegram), keyEquivalent: "")
-        menu.addItem(withTitle: "WhatsApp…", action: #selector(shareWhatsApp), keyEquivalent: "")
-        if audioFileURL != nil {
-            menu.addItem(.separator())
-            menu.addItem(withTitle: "Показать audio файл", action: #selector(revealAudio), keyEquivalent: "")
+        let hasAudio = resolvedAudioURL() != nil
+
+        menu.addItem(menuItem("Скопировать текст", #selector(copyAll)))
+
+        menu.addItem(.separator())
+
+        // Exactly as requested:
+        let playTitle = isSpeaking ? "Остановить аудио" : "Запустить аудио"
+        menu.addItem(menuItem(playTitle, #selector(audioPlayFromMenu)))
+        menu.addItem(menuItem("Перейти к аудио", #selector(audioRevealInFinder)))
+
+        menu.addItem(.separator())
+
+        // Share audio — always enabled; generate on the fly if needed.
+        menu.addItem(menuItem("Поделиться аудио → Mail", #selector(shareAudioMail)))
+        menu.addItem(menuItem("Поделиться аудио → Telegram", #selector(shareAudioTelegram)))
+        menu.addItem(menuItem("Поделиться аудио → WhatsApp", #selector(shareAudioWhatsApp)))
+
+        menu.addItem(.separator())
+
+        menu.addItem(menuItem("Текст → Mail", #selector(shareMailText)))
+        menu.addItem(menuItem("Текст → Telegram", #selector(shareTelegramText)))
+        menu.addItem(menuItem("Текст → WhatsApp", #selector(shareWhatsAppText)))
+
+        if !hasAudio {
+            let hint = NSMenuItem(
+                title: "(аудио появится после «Озвучить» или «Запустить»)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            hint.isEnabled = false
+            menu.addItem(hint)
         }
-        for item in menu.items { item.target = self }
+
         let point = NSPoint(x: 0, y: sender.bounds.height + 2)
         menu.popUp(positioning: nil, at: point, in: sender)
     }
 
-    @objc private func shareMail() {
+    private func menuItem(_ title: String, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    // MARK: - text share
+
+    @objc private func shareMailText() {
         openShareURL(scheme: "mailto", query: [
             "subject": "Quill: \(displayTitle)",
             "body": shareText(),
         ], emptyPath: true)
     }
 
-    @objc private func shareTelegram() {
-        // t.me/share wants url + text; we put content in text.
+    @objc private func shareTelegramText() {
         let text = shareText(max: 3500)
         openShareURL(absolute: "https://t.me/share/url", query: [
             "url": "https://github.com/nttylock/citedy-quill",
@@ -467,20 +519,182 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
         ])
     }
 
-    @objc private func shareWhatsApp() {
+    @objc private func shareWhatsAppText() {
         let text = shareText(max: 3500)
         openShareURL(absolute: "https://wa.me/", query: [
             "text": text,
         ])
     }
 
-    @objc private func revealAudio() {
-        if let url = audioFileURL {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+    // MARK: - audio menu actions
+
+    @objc private func audioPlayFromMenu() {
+        if isSpeaking {
+            stopAudio()
+            flashStatus("Остановлено", .secondaryLabelColor)
+            return
+        }
+        if let url = resolvedAudioURL() {
+            play(url: url)
+        } else {
+            // Generate then play.
+            generateAudioAndPlay()
         }
     }
 
-    // MARK: - audio
+    @objc private func audioRevealInFinder() {
+        ensureAudioThen { url in
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            self.flashStatus("Finder → summary.mp3", .secondaryLabelColor)
+        }
+    }
+
+    @objc private func shareAudioMail() {
+        ensureAudioThen { url in
+            if let service = NSSharingService(named: .composeEmail) {
+                service.subject = "Quill: \(self.displayTitle)"
+                if service.canPerform(withItems: [url]) {
+                    service.perform(withItems: [url, self.shareText(max: 2000)])
+                    self.flashStatus("Mail…", .secondaryLabelColor)
+                    return
+                }
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(
+                "Аудио: \(url.path)\n\n\(self.shareText(max: 1500))",
+                forType: .string
+            )
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            self.flashStatus("Файл в Finder, путь в буфере — приложи в Mail", .systemOrange)
+        }
+    }
+
+    @objc private func shareAudioTelegram() {
+        ensureAudioThen { url in
+            self.shareAudioFile(
+                url: url,
+                appBundleIds: [
+                    "ru.keepcoder.Telegram",
+                    "com.tdesktop.Telegram",
+                    "org.telegram.desktop",
+                ],
+                appName: "Telegram"
+            )
+        }
+    }
+
+    @objc private func shareAudioWhatsApp() {
+        ensureAudioThen { url in
+            self.shareAudioFile(
+                url: url,
+                appBundleIds: [
+                    "net.whatsapp.WhatsApp",
+                    "desktop.WhatsApp",
+                ],
+                appName: "WhatsApp"
+            )
+        }
+    }
+
+    /// If mp3 missing — generate via Cartesia, then run action.
+    private func ensureAudioThen(_ action: @escaping (URL) -> Void) {
+        if let url = resolvedAudioURL() {
+            action(url)
+            return
+        }
+        guard let text = speakableText() else {
+            flashStatus("Сначала дождись саммари или нажми Протокол", .systemOrange)
+            return
+        }
+        guard let apiKey = Config.cartesiaAPIKey() else {
+            flashStatus("Нет CARTESIA_API_KEY", .systemRed)
+            return
+        }
+        setPhase(.loading("Готовлю аудио…"))
+        setActionsEnabled(false)
+        let voice = Config.cartesiaVoiceId()
+        let model = Config.cartesiaModelId()
+        let lang = Config.transcriptionLanguage()
+        Task {
+            do {
+                let mp3 = try await CartesiaService.synthesizeMP3(
+                    text: text,
+                    language: lang,
+                    apiKey: apiKey,
+                    voiceId: voice,
+                    modelId: model
+                )
+                let url: URL
+                if let dir = self.sessionDir {
+                    url = dir.appendingPathComponent("summary.mp3")
+                    try mp3.write(to: url, options: .atomic)
+                } else {
+                    url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("quill-\(UUID().uuidString).mp3")
+                    try mp3.write(to: url, options: .atomic)
+                }
+                await MainActor.run {
+                    self.audioFileURL = url
+                    self.setPhase(.ready)
+                    self.setActionsEnabled(true)
+                    action(url)
+                }
+            } catch {
+                await MainActor.run {
+                    self.setPhase(.ready)
+                    self.setActionsEnabled(true)
+                    self.flashStatus("Аудио: \(error)", .systemRed)
+                }
+            }
+        }
+    }
+
+    /// Open mp3 with the messenger if installed; else Finder + clipboard path.
+    private func shareAudioFile(url: URL, appBundleIds: [String], appName: String) {
+        for bid in appBundleIds {
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) {
+                let config = NSWorkspace.OpenConfiguration()
+                NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: config) { _, error in
+                    Task { @MainActor in
+                        if let error {
+                            self.fallbackShareAudio(url: url, appName: appName, error: "\(error)")
+                        } else {
+                            self.flashStatus("Открыто в \(appName)", .secondaryLabelColor)
+                        }
+                    }
+                }
+                return
+            }
+        }
+        fallbackShareAudio(url: url, appName: appName, error: nil)
+    }
+
+    private func fallbackShareAudio(url: URL, appName: String, error: String?) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+        let hint = error.map { " (\($0))" } ?? ""
+        flashStatus(
+            "\(appName) не найден\(hint). Файл в Finder, путь скопирован",
+            .systemOrange
+        )
+    }
+
+    private func resolvedAudioURL() -> URL? {
+        if let audioFileURL, FileManager.default.fileExists(atPath: audioFileURL.path) {
+            return audioFileURL
+        }
+        if let dir = sessionDir {
+            let candidate = dir.appendingPathComponent("summary.mp3")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                audioFileURL = candidate
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    // MARK: - audio playback
 
     private func play(url: URL) {
         do {
@@ -526,14 +740,20 @@ final class TranscriptWindowController: NSWindowController, NSWindowDelegate, AV
     // MARK: - text helpers
 
     /// Prefer summary/protocol for TTS; fall back to short transcript head.
+    /// Always strip markdown / labels so Cartesia does not say "hash hash".
     private func speakableText() -> String? {
         let s = summaryPlain.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw: String
         if !s.isEmpty, !s.hasPrefix("Саммари недоступно"), s != "Суммаризация…" {
-            return String(s.prefix(2500))
+            raw = s
+        } else {
+            let t = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.isEmpty { return nil }
+            raw = t
         }
-        let t = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return nil }
-        return String(t.prefix(1500))
+        let speech = TranscriptCleanup.forSpeech(raw)
+        if speech.isEmpty { return nil }
+        return String(speech.prefix(2500))
     }
 
     private func shareText(max: Int? = nil) -> String {

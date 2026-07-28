@@ -39,6 +39,10 @@ final class SystemAudioRecorder {
     /// used to offset-align the two tracks' transcript timestamps.
     private(set) var firstBufferAt: Date?
 
+    /// Stable UUID so each Start does not look like a brand-new tap to TCC.
+    /// Changing this string will re-prompt System Audio once.
+    private static let tapUUID = UUID(uuidString: "C17ED401-1140-4000-8000-517E4A0D1010")!
+
     /// Start capturing system audio, encoding AAC into `url` (use a .caf
     /// extension — CAF needs no finalization pass, so a crash mid-meeting
     /// loses nothing already written).
@@ -49,6 +53,9 @@ final class SystemAudioRecorder {
         description.name = "quill system tap"
         description.isPrivate = true
         description.muteBehavior = .unmuted
+        // Keep the same UUID across sessions so macOS reuses the existing
+        // System Audio Recording grant instead of treating every Start as new.
+        description.uuid = Self.tapUUID
 
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateProcessTap(description, &newTapID)

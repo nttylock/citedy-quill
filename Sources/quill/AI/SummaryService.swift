@@ -36,6 +36,9 @@ enum SummaryService {
           - "summary": 2-5 sentences covering the main outcome
           - "key_points": array of 3-8 short bullet strings (decisions, action items, facts)
         Ignore filler, greetings, and speech-to-text noise. Be concrete.
+        IMPORTANT: Completely ignore lines about «Редактор субтитров», «Корректор»,
+        subtitle credits, "продолжение следует", or similar Whisper silence hallucinations.
+        Never invent participants from those credits.
         """
 
         let content = try await chatJSON(
@@ -66,6 +69,9 @@ enum SummaryService {
         ## Открытые вопросы
         ## Краткий итог (2-3 sentences)
         Be factual. No filler. If something is unclear, say so briefly.
+        CRITICAL: Ignore «Редактор субтитров», «Корректор А.…», subtitle/credit lines —
+        they are speech-to-text hallucinations on silence, NOT real participants.
+        Do not list them under Участники.
         Return ONLY the markdown protocol, no JSON wrapper.
         """
         return try await chatText(

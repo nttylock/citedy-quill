@@ -26,7 +26,8 @@ enum CartesiaService {
         voiceId: String,
         modelId: String
     ) async throws -> Data {
-        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Defense in depth: never send markdown markers to TTS.
+        let cleaned = TranscriptCleanup.forSpeech(text)
         guard !cleaned.isEmpty else { throw CartesiaServiceError.emptyAudio }
 
         let lang = cartesiaLanguage(language)

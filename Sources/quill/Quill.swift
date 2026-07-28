@@ -290,7 +290,9 @@ final class QuillAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        controller?.showPanel()
+        // No tiny control panel — reopen shows the result window if any,
+        // otherwise the recordings folder.
+        controller?.reopenUI()
         return false
     }
 }
@@ -299,7 +301,6 @@ final class QuillAppDelegate: NSObject, NSApplicationDelegate {
 final class AppController {
     private let root: URL
     private let menuBar: MenuBarController
-    private var panel: ControlPanel?
     /// Lazy: creating an NSWindow during init poisons the menu-bar status item.
     private var transcriptWindow: TranscriptWindowController?
     private let transcription = TranscriptionCoordinator()
@@ -312,6 +313,7 @@ final class AppController {
     private func resultWindow() -> TranscriptWindowController {
         if let transcriptWindow { return transcriptWindow }
         let w = TranscriptWindowController()
+        w.onQuit = { [weak self] in self?.shutdown() }
         transcriptWindow = w
         return w
     }
@@ -322,7 +324,6 @@ final class AppController {
         menuBar.onToggle = { [weak self] in self?.toggle() }
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
-        menuBar.onShowPanel = { [weak self] in self?.showPanel() }
 
         ipcObserver = DistributedNotificationCenter.default().addObserver(
             forName: QuillIPC.notificationName,
@@ -348,20 +349,12 @@ final class AppController {
         }
     }
 
-    func showPanel() {
-        let panel = ensurePanel()
-        panel.show()
-    }
-
-    private func ensurePanel() -> ControlPanel {
-        if let panel { return panel }
-        let panel = ControlPanel()
-        panel.onToggle = { [weak self] in self?.toggle() }
-        panel.onOpenFolder = { [weak self] in self?.openFolder() }
-        panel.onQuit = { [weak self] in self?.shutdown() }
-        panel.update(recording: session != nil, elapsed: nil)
-        self.panel = panel
-        return panel
+    func reopenUI() {
+        // Never dump the user into Finder on reopen — only the result window.
+        let win = resultWindow()
+        win.showWindow(nil)
+        win.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func shutdown() {
@@ -377,7 +370,7 @@ final class AppController {
         guard let raw, let cmd = QuillIPC.Command(rawValue: raw) else { return }
         switch cmd {
         case .start:
-            if session == nil { startSession() }
+            if session == nil { Task { await self.startSession() } }
         case .stop:
             if session != nil { stopSession() }
         case .toggle:
@@ -388,7 +381,7 @@ final class AppController {
                 : "recording · \(session!.dir.path)"
             FileHandle.standardError.write(Data("status: \(body)\n".utf8))
         case .show:
-            showPanel()
+            reopenUI()
         case .quit:
             shutdown()
         }
@@ -396,13 +389,23 @@ final class AppController {
 
     private func toggle() {
         if session == nil {
-            startSession()
+            Task { await self.startSession() }
         } else {
             stopSession()
         }
     }
 
-    private func startSession() {
+    private func startSession() async {
+        // Mic: OS remembers after first Allow (same code signature + bundle id).
+        let micOK = await Permissions.ensureMicrophone()
+        if !micOK {
+            resultWindow().presentFailure(
+                "Нет доступа к микрофону.\n\nSystem Settings → Privacy & Security → Microphone → включи Quill."
+            )
+            Permissions.openMicrophonePrivacySettings()
+            return
+        }
+
         do {
             let newSession = try RecordingSession(root: root)
             try newSession.start()
@@ -410,12 +413,21 @@ final class AppController {
             FileHandle.standardError.write(Data("● recording → \(newSession.dir.path)\n".utf8))
         } catch {
             FileHandle.standardError.write(Data("recording start failed: \(error)\n".utf8))
-            resultWindow().presentFailure("Не удалось начать запись:\n\(error)")
+            let msg = "\(error)"
+            // Common when System Audio was denied or never granted.
+            if msg.contains("process tap") || msg.contains("System Audio") || msg.contains("OSStatus") {
+                resultWindow().presentFailure(
+                    "Нет доступа к system audio.\n\nНажми Allow один раз в диалоге, либо:\nSystem Settings → Privacy & Security → Screen & System Audio Recording → Quill.\n\n\(msg)"
+                )
+                Permissions.openSystemAudioPrivacySettings()
+            } else {
+                resultWindow().presentFailure("Не удалось начать запись:\n\(msg)")
+            }
             return
         }
 
+        // Menu bar becomes red mic + live timer — no floating control panel.
         menuBar.update(recording: true, elapsed: "0:00")
-        panel?.update(recording: true, elapsed: "0:00")
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -432,13 +444,16 @@ final class AppController {
         ticker?.invalidate()
         ticker = nil
         menuBar.update(recording: false, elapsed: nil)
-        panel?.update(recording: false, elapsed: nil)
 
         let dir = session.dir
         let name = dir.lastPathComponent
         activeResultSession = name
-        // Open our window immediately — no osascript, no external .md.
-        resultWindow().presentLoading(sessionName: name, sessionDir: dir)
+        // ONLY the result window — never open Finder/folder on stop.
+        let win = resultWindow()
+        win.presentLoading(sessionName: name, sessionDir: dir)
+        win.showWindow(nil)
+        win.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         Task { [transcription] in await transcription.enqueue(dir) }
     }
 
@@ -446,14 +461,12 @@ final class AppController {
         switch status {
         case .idle:
             menuBar.updateTranscription(nil)
-            panel?.update(recording: false, elapsed: nil)
 
         case .transcribing(let name, let queued):
             let text = queued > 0
                 ? "transcribing \(name) · \(queued) queued"
                 : "transcribing \(name)"
             menuBar.updateTranscription(text)
-            panel?.update(recording: false, elapsed: nil, transcription: text)
             if activeResultSession == name || activeResultSession == nil {
                 activeResultSession = name
                 resultWindow().updateLoadingStatus(
@@ -465,7 +478,6 @@ final class AppController {
 
         case .completed(let name, let dir, let plainText, let markdown):
             menuBar.updateTranscription(nil)
-            panel?.update(recording: false, elapsed: nil)
             activeResultSession = name
             resultWindow().presentTranscript(
                 sessionName: name,
@@ -478,7 +490,6 @@ final class AppController {
         case .failed(let name, let message):
             let text = "transcription failed · \(name)"
             menuBar.updateTranscription(text)
-            panel?.update(recording: false, elapsed: nil, transcription: text)
             if activeResultSession == name || activeResultSession == nil {
                 resultWindow().presentFailure("Ошибка транскрипции:\n\(message)")
             }
@@ -517,7 +528,6 @@ final class AppController {
         guard let session else { return }
         let elapsed = Self.format(Date().timeIntervalSince(session.startedAt))
         menuBar.update(recording: true, elapsed: elapsed)
-        panel?.update(recording: true, elapsed: elapsed)
     }
 
     private func openFolder() {
